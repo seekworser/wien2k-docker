@@ -1,0 +1,533 @@
+#!/bin/csh -f
+
+set tmp  = .tmp_hfpara.$$
+set tmp2 = .tmp_hfpara.$$_2
+rm -f .tmp_lapw1para.* .tmp_testpara_new.* >&/dev/null
+rm -f .hfpara.* >&/dev/null
+touch .lock_
+foreach i (.lock_*)
+    rm $i
+end
+
+onintr exit
+set name	= $0
+set bin		= $name:h	#default directory for WIEN-executables
+if !(-d $bin) set bin = .
+
+unalias rm
+alias   testinput       'if (! -e \!:1 ||  -z \!:1) goto \!:2'
+alias   testerror       'if (! -z \!:1.error) goto error'
+alias   sortoutput      'if (-f .stdout\!:1) bashtime2csh.pl_lapw .stdout\!:1 > .temp\!:1; grep \% .temp\!:1 >> .time\!:1; grep -v \% .temp\!:1 | perl -e "print stderr <STDIN>"'
+
+set band
+set gw
+set redklist
+set so
+set vnonloc
+set nmrhf
+set t	    = time  
+set log     = :parallel
+set defmach = `hostname`
+set updn			# spinpolarization switch
+set dnup    = 'dn'		# spinpolarization switch
+set sc				# semicore-switch
+set cmplx
+set cmplxm
+set vector_split
+set remote = ssh
+set init = init:
+set res  = residue:
+set taskset0
+set taskset=no  
+
+if (-e .machines && ! -z .machines) then
+    set omp_threads=`grep omp_hf: .machines | grep -v '#' | sed 's/omp_hf://' | tail -n1`
+    if ("$omp_threads" != '') then
+        setenv OMP_NUM_THREADS $omp_threads
+    else
+        set omp_threads=`grep omp_global: .machines | grep -v '#' | sed 's/omp_global://' | tail -n1`
+        if ("$omp_threads" != '') setenv OMP_NUM_THREADS $omp_threads
+    endif
+endif
+if (! $?OMP_NUM_THREADS ) setenv OMP_NUM_THREADS 1
+set usershell=`getent passwd $user | sed -e 's/ //g' | sed -e 's^/bin/^  ^' | awk '{print $2}'`
+if ("$usershell" == 'tcsh') then
+   set set_OMP_NUM_THREADS="setenv OMP_NUM_THREADS $OMP_NUM_THREADS"
+else if ("$usershell" == 'bash') then
+   set set_OMP_NUM_THREADS="export OMP_NUM_THREADS=$OMP_NUM_THREADS"
+else
+   set set_OMP_NUM_THREADS="setenv OMP_NUM_THREADS $OMP_NUM_THREADS"
+endif
+
+############################################################################
+# In this section use 0 to turn of an option, 1 to turn it on, 
+# respectively choose a value
+
+set useremote   = 1             # using remote shell to launch processes
+set mpiremote   = 1
+setenv DELAY    0.1             # delay launching of processes by n seconds
+setenv SLEEPY   1               # additional sleep before checking
+set debug       = 0             # set verbosity of debugging output
+
+############################################################################
+
+############################################################################
+# and now we look if we should override the defaults
+if (-e $bin/parallel_options) then
+        source $bin/parallel_options
+endif 
+if ( $?TASKSET ) then
+        set taskset="$TASKSET"
+endif
+if ( $?WIEN_MPIRUN ) then
+  set mpirun = "$WIEN_MPIRUN"
+else
+  set mpirun='mpirun -np _NP_ _EXEC_'
+endif
+
+
+if ( $?USE_REMOTE ) then
+        set useremote = $USE_REMOTE
+endif
+if ( $?MPI_REMOTE ) then
+        set mpiremote = $MPI_REMOTE
+endif
+if(! $?CORES_PER_NODE ) then
+     #echo CORES_PER_NODE not defined, setting it to 1 for srun command
+     setenv CORES_PER_NODE 1
+endif
+if (( ! $?PINNING_COMMAND ) || ( ! $?PINNING_LIST )) setenv NOPINNING
+if ( ! $?OMP_NUM_THREADS ) then
+   setenv OMP_NUM_THREADS 1
+endif
+
+############################################################################
+
+
+if ($#argv < 1) then
+	echo usage: $0 deffile
+	exit
+endif
+
+while ($#argv)
+  switch ($1)
+  case -h:
+  case -H: 
+    set help
+    shift; breaksw
+  case -up:
+    set updn = 'up'
+    set dnup = 'dn'
+    shift; breaksw
+  case -dn:
+    set updn = 'dn'
+    set dnup = 'up'
+    shift; breaksw
+  case -sc:
+    set sc = 's'
+    shift; breaksw
+  case -c:
+    set cmplx = c
+    set cmplxm = '-c'
+    shift; breaksw
+  case -so:
+    set so = '-so'
+    shift; breaksw
+  case -band:
+    set band = '-band'
+    shift; breaksw
+  case -gw:
+    set gw = '-gw'
+    shift; breaksw
+  case -redklist:
+    set redklist = '-redklist'
+    shift; breaksw
+  case -slater:
+    set vnonloc = '-slater'
+    shift; breaksw
+  case -kli:
+    set vnonloc = '-kli'
+    shift; breaksw
+  case -nmrhf:
+    set nmrhf = '-nmrhf'
+    shift; breaksw
+  default:
+    set def = $1:r
+    shift; breaksw
+  endsw
+end
+set exe = $bin/hf$cmplx
+set exe = hf$cmplx
+#are we running parallel?
+testinput .processes single
+echo "running HF in parallel mode"
+echo "RUNNING" >.hfpara
+
+#before we start, we wipe away all parallel error files
+if ( -e hf.error ) rm *hf*.error
+if ( -e uphf.error ) rm *hf*.error
+if ( -e dnhf.error ) rm *hf*.error
+
+if ( -e hf_1.error ) rm *hf_*.error
+if ( -e uphf_1.error ) rm *hf_*.error
+if ( -e dnhf_1.error ) rm *hf_*.error
+if ( -e .timehf_1) rm .timehf_*
+
+
+if (-e .machines.help) rm .machines.help
+set vector_split=`grep lapw2_vector_split: .machines |grep -v '#'| cut -d: -f 2`
+grep -v $init .processes|grep : | grep -v $res >$tmp2
+set mist     = `wc $tmp2 `
+set maxproc  = $mist[1]
+set machine  = `grep  $init .processes | cut -f2 -d: | cut -f1 -d' ' | xargs`
+if ($#machine > $maxproc) then
+    set machine  = `grep  $init .processes |head -$maxproc| cut -f2 -d: | cut -f1 -d' ' | xargs`
+endif
+set lockfile = `cut -f2 -d: $tmp2 | awk '{print $1 NR}'|xargs`
+set residue  = `grep $res .processes|cut -f2 -d:`
+if ($residue == "") unset residue
+
+set number_per_job2 = `cut -f4 -d: $tmp2`
+
+if ( $vector_split != '' ) then
+  set loop=0
+  while ($loop < $maxproc)
+     @ loop ++
+     if ($vector_split > $number_per_job2[$loop] ) set vector_split=$number_per_job2[$loop]
+     @ number_per_job2[$loop] = ( $number_per_job2[$loop] / $vector_split ) * $vector_split
+  end
+endif
+
+# producing .machineXX files
+set i=1
+while ($i <= $maxproc )
+  set tmpmach=`grep $init .processes |head -$i| tail -1 |cut -f2 -d:`
+  set j=2
+  echo $tmpmach[1] > .machine$i
+  while ($j <= $#tmpmach)
+    echo $tmpmach[$j] >> .machine$i
+    @ j ++
+  end
+  @ i ++
+end
+
+set mach = `cut -f5 -d: $tmp2`
+
+#bounding cpus
+set p_cpu_bound = ($machine)
+set i=1
+set cpu=0
+set old=old
+while ($i <= $#p_cpu_bound)
+  if($old != $p_cpu_bound[$i]) then
+     set cpu=0
+  endif
+  set old=$p_cpu_bound[$i]
+  set p_cpu_bound[$i] = $cpu
+  @ cpu ++
+  @ i ++
+end
+#echo $machine
+#echo $p_cpu_bound
+
+if ($debug > 0) echo machines: $machine
+
+
+echo "** " Error in Parallel HF >$def.error
+
+
+#get name of case
+setenv PWD `pwd|sed "s/tmp_mnt\///"`
+setenv PWD $cwd
+set case    = $PWD
+set case    = $case:t          
+if ($case == "") then
+  echo "ERROR: cannot detect working directory $cwd -> exit"
+  exit 1
+endif
+if ($debug > 0) echo Setting up case $case for parallel execution
+if ($debug > 0) echo of HF
+if ($debug > 0) echo "  "
+#
+
+touch $case.scfhf${updn}_1
+
+#creating  def files
+if ($debug > 0) echo " "
+if ($debug > 0) echo -n "creating "$def"_*.def:  "
+set i = 1
+while ($i <= $maxproc)
+  if ($debug > 0) echo -n "$i "
+  cp $def.def .tmp
+  #subsituting in files:
+  cat <<theend >.script
+s/vectorhf$dnup'/vectorhf${dnup}_$i'/w .mist
+s/vectorhf$updn'/vectorhf${updn}_$i'/w .mist
+s/vectorso$dnup/&_$i/w .mist
+s/vectorso$updn/&_$i/w .mist
+s/energyhf$dnup'/energyhf${dnup}_$i'/w .mist
+s/energyhf$updn'/energyhf${updn}_$i'/w .mist
+s/energyhf${dnup}_rbz/&_$i/w .mist
+s/energyhf${updn}_rbz/&_$i/w .mist
+s/outputhf$updn/&_$i/w .mist
+s/almblm$updn'/almblm${updn}_$i'/w .mist
+s/klist_ibz'/klist_$i'/w .mist
+s/klist_band/klist_band_$i/w .mist
+s/vectordum$dnup/&_$i/w .mist
+s/vectordum$updn/&_$i/w .mist
+s/vector$dnup'/vector${dnup}_$i'/w .mist
+s/vector$updn'/vector${updn}_$i'/w .mist
+s/energyso$dnup/&_$i/w .mist
+s/energyso$updn/&_$i/w .mist
+s/energydum/&_$i/w .mist
+s/energy$dnup'/energy${dnup}_$i'/w .mist
+s/energy$updn'/energy${updn}_$i'/w .mist
+s/scfhf$updn/&_$i/w .mist
+s/gw$updn/&_$i/w .mist
+s/r2v_nonlocvv'/r2v_nonlocvv_$i'/w .mist
+s/r2v_nonlocvvdn'/r2v_nonlocvvdn_$i'/w .mist
+s/r2v_nonlocvc'/r2v_nonlocvc_$i'/w .mist
+s/r2v_nonlocvcdn'/r2v_nonlocvcdn_$i'/w .mist
+
+theend
+
+sed -f .script .tmp > .tmp1
+
+cp .tmp1 ${def}_$i.def
+  @ i ++
+end
+if ($debug > 0) echo " "
+
+
+if( ! $?NOPINNING ) then
+    set corelist = ($PINNING_LIST)
+    set corelist0=($corelist)
+    set j=1
+    set total_jobs = 0
+    set number_of_p_jobs=$maxproc
+    while($j <= $number_of_p_jobs)
+      @ total_jobs = $total_jobs + $number_per_job2[$j]
+      @ j ++
+    end
+    @ total_nodes = $number_of_p_jobs * $total_jobs * $OMP_NUM_THREADS / $CORES_PER_NODE
+    set i=1
+    while($i <= $total_nodes)
+      set corelist = ($corelist,$corelist0)
+      @ i ++
+    end
+endif
+
+#starting processes
+if ($debug > 0) echo " "
+if ($debug > 0) echo "starting process:  "
+
+echo "->  "starting parallel hf$cmplx at `date` >>$log
+
+set loop    = 0
+set endloop = 0
+set runmach = ""
+echo "files:$maxproc" >.processes2
+while ($loop < $maxproc)
+  set p = 1
+  if ($?residue && $?resok) set p = 2
+  while ($p <= $#machine)
+    if ($loop < $maxproc) then
+	if !(-e .lock_$lockfile[$p]) then
+	    @ loop ++
+            touch ${def}_${loop}.error
+	    echo "${loop}:${maxproc} : $p_cpu_bound[$p]" >.processes2
+	    if ($debug > 0) echo prepare $loop on $machine[$p]
+	    set runmach = ($runmach $machine[$p])
+	    echo $runmach >>.processes2
+	    if ($debug > 1) echo "   >  $exe ${def}_${loop}.def on $machine[$p]"
+	    if ($debug > 1) echo "   >  $exe ${def}_${loop}.def on $machine[$p]">>$log
+	    if( $number_per_job2[$loop] == 1 ) then
+	      if ($useremote == 1) then
+		if ($debug > 1) echo use remote
+		touch .lock_$lockfile[$p]
+		echo -n "$runmach[$loop] ">.timehf_$loop
+                if("$taskset" != 'no') set taskset0="$taskset $p_cpu_bound[$p]"
+		($remote $machine[$p] "cd $PWD;$set_OMP_NUM_THREADS;$t $taskset0 $exe ${def}_${loop}.def;fixerror_lapw ${def}_$loop";rm -f .lock_$lockfile[$p]) >& .stdouthf_$loop; sortoutput hf_$loop &
+	      else
+		if ($debug > 1) echo not using remote shell
+		touch .lock_$lockfile[$p]
+		echo -n "$runmach[$loop] " >.timehf_$loop
+		(cd $PWD;$t $exe ${def}_${loop}.def;rm -f .lock_$lockfile[$p]) >>.timehf_$loop  &
+	      endif
+	    else
+	      if ($debug > 1) echo running parallel hf
+	      touch .lock_$lockfile[$p]
+	      echo -n "$runmach[$loop] " >.timehf_$loop
+### srun-implementation, RUH Nov 16th 2015
+              @ number_of_nodes=$number_per_job2[1] / $CORES_PER_NODE
+              @ number_of_nodes_tmp=$number_of_nodes * $CORES_PER_NODE
+              if ($number_of_nodes_tmp != $number_per_job2[1]) then
+                  @ number_of_nodes=$number_of_nodes + 1
+              endif
+              @ offset=$number_per_job2[1] * $OMP_NUM_THREADS
+              set offset_tmp=0
+              @ offset = $offset / $CORES_PER_NODE
+              @ offset_tmp=$offset * $CORES_PER_NODE
+              if($offset_tmp == $number_per_job2[1]) then
+                 @ offset=$offset * ($loop - 1)
+              else
+                 @ offset=$number_per_job2[1] * $OMP_NUM_THREADS
+                 @ offset=($offset * ($loop - 1)) / $CORES_PER_NODE 
+              endif
+              set ttt_temp=(`echo $mpirun | sed -e "s^_NP_^$number_per_job2[$loop]^" -e "s^_EXEC_^$WIENROOT/${exe}_mpi ${def}_$loop.def $loop^" -e "s^_HOSTS_^.machine$mach[$loop]^" -e "s^_nodes_^$number_of_nodes^" -e "s^_offset_^$offset^"`)
+              if( $?NOPINNING ) then
+                  set ttt=(`echo $ttt_temp | sed -e "s^_PINNING_^^"`)
+              else
+                  if ( $maxproc == 1) then
+                       set ttt=(`echo $ttt_temp | sed -e "s^_PINNING_^$PINNING_COMMAND$PINNING_LIST^"`)
+                  else
+#                       set corelist = (`echo $PINNING_LIST | sed -e "s^,^ ^g"`)
+#                       @ total_nodes = $maxproc * $number_per_job2[$p] * $OMP_NUM_THREADS / $CORES_PER_NODE
+#                       @ corelist_start = $number_per_job2[$p] * ($p - 1 - $offset * $total_nodes) + 1
+#                       @ corelist_end = $number_per_job2[$p] * ($p - $offset * $total_nodes)
+#                       set locallist=""
+#                       while($corelist_start <= $corelist_end)
+#                             set locallist=(`echo "$locallist$corelist[$corelist_start]"`)
+#                             @ corelist_start ++
+#                             if($corelist_start <= $corelist_end) set locallist=(`echo "$locallist,"`)
+#                       end
+
+                       @ total_nodes = $maxproc * $number_per_job2[$p] * $OMP_NUM_THREADS / $CORES_PER_NODE
+                       @ corelist_start = $number_per_job2[$p] * ($p - 1) + 1
+                       @ corelist_end = $corelist_start + $number_per_job2[$p] - 1 
+                       set locallist=(`echo $corelist | cut -d, -f$corelist_start-$corelist_end`)
+                       set ttt=(`echo $ttt_temp | sed -e "s^_PINNING_^$PINNING_COMMAND$locallist^"`)
+                  endif
+              endif
+
+              if ($mpiremote == 1) then
+	         set remotemachine = `head -1 .machine$mach[$loop]`
+                 ($remote $remotemachine "cd $PWD;$set_OMP_NUM_THREADS;$t $ttt $vector_split;rm -f .lock_$lockfile[$p]") >>.timehf_$loop &
+              else
+	         (cd $PWD;$t $ttt $vector_split;rm -f .lock_$lockfile[$p]) \
+		>>.timehf_$loop &
+              endif
+	    endif
+	endif
+        if ($debug > 1) echo sleeping for $DELAY seconds
+        sleep $DELAY
+            jobs -l >.hf${cmplx}para.$$.`hostname`
+    endif
+    @ p ++
+  end
+end
+
+#wait for execution to be completed
+if ($debug > 0) echo " "
+if ($debug > 0) echo "waiting for processes:  "
+wait
+
+# make sure even stupid NFS writes are done
+sleep $SLEEPY
+
+
+set i = 1
+while ($i <= $maxproc)
+  testerror "$def"_$i
+  @ i ++
+end
+
+#cpu summary:
+set i = 1
+while ($i <= $maxproc)
+    echo "      "`cat .timehf_$i`
+    echo "      "`cat .timehf_$i` >>$log
+    @ i ++
+end
+
+# postanalysis
+echo "   Summary of hfpara:" >$tmp
+set p = 1
+while ($p <= $#machine)
+  if($p <= $#runmach) then
+    set m = $runmach[$p]
+    cat .timehf_* | grep -w $m |tr "(" " "|tr ")" " "|tr ":" " " |sed "s/u / /"| \
+	    awk '{u += $2; cl += 60*$4+$5} \
+		END {print "   '$m'\t user=" u "\t wallclock=" cl}' >>$tmp
+  endif
+  @ p ++
+end
+
+uniq < $tmp |tee -a $log
+
+echo "<-  "done at `date` >>$log
+#now sum all the clm-files 
+if ($debug > 0) echo " "
+if ($debug > 0) echo "summing up all clm-files"
+
+set updn1 =
+if ($updn == up || $updn == dn ) set updn1 = -$updn
+$bin/x sumhfpara $cmplxm $updn1 $band $gw $nmrhf $redklist $so $vnonloc -d 
+
+set def2 = "$updn"sumhfpara
+echo "->  "starting sumhfpara $maxproc on $defmach at `date` >>$log
+$bin/sumhfpara$cmplx $def2.def $maxproc
+testerror $def2
+
+#
+correction:
+#Correcting scfhf file
+if (-e $case.scfhf${updn}_2) then
+  set aexhf=`grep :AEXHFVV1 $case.scfhf${updn}_* | cut -d: -f 4 | sed -e "s/(Ry)/ /"`
+else
+  set aexhf=`grep :AEXHFVV1 $case.scfhf${updn}_* | cut -d: -f 3 | sed -e "s/(Ry)/ /"`
+endif
+set aexhfsum=`echo $aexhf | bc`
+echo ":AEXHFVV1  :        $aexhfsum      (Ry)" >.hftmp
+sed -e "/:AEXHFVV1/d" $case.scfhf${updn}_1 | sed -e "/valence-valence HF exchange energy in unit cell/ r .hftmp" > .hftmp2
+rm .hftmp
+
+set ccesum=`grep :CCESUM $case.scfhf${updn}_* | cut -d: -f 4 | sed -e "s/(Ry)/ /"`
+if ($#ccesum != 0) then
+  set iloop=1
+  set ccesum1
+  set nump=$#ccesum
+  while ( $iloop <= $nump )
+  set ccesum1=($ccesum1 $ccesum[$iloop] +)
+  @ iloop ++
+  end
+  @ iloop = ($nump * 2) - 1
+  set ccesumsum=`echo $ccesum1[1-$iloop] | bc`
+  echo ":CCESUM    :        $ccesumsum      (Ry)" >.hftmp
+  sed -e "/:CCESUM/d" .hftmp2 | sed -e "/\*\*\*/ r .hftmp" > $case.scfhf$updn
+  rm .hftmp .hftmp2
+else
+  mv .hftmp2 $case.scfhf$updn
+endif
+
+echo "<-  "done at `date` >>$log
+echo "-----------------------------------------------------------------">>$log
+rm $def.error
+touch $def.error
+rm $tmp* >&/dev/null
+rm .hf${cmplx}para.$$.`hostname` >&/dev/null
+echo "DONE" >.hfpara
+if ( -e .timehf_1) rm .timehf_*
+if ( -e .temphf_1) rm .temphf_*
+if ( -e .stdouthf_1) rm .stdouthf_*
+exit 0
+
+single:
+echo "running in single mode"
+$exe $def.def
+rm $tmp* >&/dev/null
+rm .hf${cmplx}para.$$.`hostname` >&/dev/null
+exit 0
+
+
+error:
+echo "** " HF crashed!
+echo "** " HF crashed at `date`>>$log
+echo "** " check ERROR FILES! >>$log
+echo "-----------------------------------------------------------------">>$log
+echo "** " testerror: Error in Parallel HF >>$def.error
+rm $tmp* >&/dev/null
+rm .hf${cmplx}para.$$.`hostname` >&/dev/null
+echo "ERROR" >.hfpara
+exit 1
+

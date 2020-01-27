@@ -1,0 +1,23 @@
+c
+
+LG
+
+gfortran
+gcc
+
+
+N
+n
+O
+-ffree-form -O2 -ftree-vectorize -march=native -ffree-line-length-none -ffpe-summary=none
+R
+-llapack -lblas
+L
+$(FOPT) -L/usr/local/lib
+S
+
+y
+N
+N
+q
+A
